@@ -1,3 +1,26 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import psycopg2
+import pyotp
+from flask_bcrypt import Bcrypt
+from dotenv import load_dotenv
+import os
+from flask_jwt_extended import JWTManager, create_access_token, create_refresh_token, jwt_required, get_jwt_identity, get_jwt
+import logging
+import qrcode
+import io
+import base64
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.FileHandler("app.log"), logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
@@ -18,7 +41,6 @@ config_db_config = {
 
 def get_db_connection():
     return psycopg2.connect(**config_db_config)
-
 
 @app.route('/register', methods=['POST', 'OPTIONS'])
 def register():
@@ -63,9 +85,6 @@ def register():
         otp_secret = cur.fetchone()[0]
         conn.commit()
 
-        cur.close()
-        conn.close()
-
         # Generate OTP URI
         otp_uri = pyotp.totp.TOTP(otp_secret).provisioning_uri(email, issuer_name="MyApp")
 
@@ -75,79 +94,92 @@ def register():
         qr.save(img_buffer, format="PNG")
         qr_base64 = base64.b64encode(img_buffer.getvalue()).decode()
 
+        logger.info(f"User registered: {email}, role: {role}")
         return jsonify({"message": "Registration successful!", "qr_code": qr_base64})
 
     except psycopg2.IntegrityError:
+        logger.error(f"Email already registered: {email}")
         return jsonify({"message": "Email already registered!"}), 400
+    finally:
+        cur.close()
+        conn.close()
 
 @app.route('/login', methods=['POST'])
 def login():
     data = request.json
     email = data.get('email')
     password = data.get('password')
-    otp_code = data.get('otp_code')  # OTP entered by user
-    requested_role = data.get('role')  # Role selected in frontend (admin/user)
-    location = data.get('location')  # New field for user location
+    otp_code = data.get('otp_code')
+    requested_role = data.get('role')
+    location = data.get('location')
 
-    if not email or not password or not requested_role:
+    # Validation with detailed logging
+    if not all([email, password, requested_role]):
+        logger.warning(f"Login failed: Missing fields - email={email}, password={'***' if password else None}, role={requested_role}")
         return jsonify({"message": "Email, password, and role are required!"}), 400
 
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-
-        # Fetch user details, including pwdchanged
+        # Updated query to include rejectreason
         cur.execute("""
-            SELECT password_hash, otp_secret, role, status, location, pwdchanged 
+            SELECT password_hash, otp_secret, role, status, location, pwdchanged, rejectreason 
             FROM users 
             WHERE email = %s
         """, (email,))
         user = cur.fetchone()
 
         if not user:
+            logger.info(f"Login failed: User not found - {email}")
             return jsonify({"message": "User not found!"}), 400
 
-        password_hash, otp_secret, actual_role, status, stored_location, pwdchanged = user
+        password_hash, otp_secret, actual_role, status, stored_location, pwdchanged, rejectreason = user
 
-        # Check if the user is approved
-        if status != "approved":
+        # Check status and return rejectreason if rejected
+        if status == "rejected":
+            logger.info(f"Login failed: Account rejected - {email}, reason: {rejectreason}")
+            return jsonify({
+                "message": "Your account has been rejected!",
+                "reject_reason": rejectreason or "No specific reason provided"
+            }), 403
+        elif status != "approved":
+            logger.info(f"Login failed: Account not approved - {email}")
             return jsonify({"message": "Your account is not approved yet!"}), 403
 
-        # Check if the role matches
+        # Proceed with other validation checks
         if requested_role != actual_role:
+            logger.info(f"Login failed: Role mismatch for {email} - requested: {requested_role}, actual: {actual_role}")
             return jsonify({"message": f"Invalid role! You are registered as a {actual_role}."}), 403
-
-        # Check if the location matches
         if stored_location != location:
+            logger.info(f"Login failed: Location mismatch for {email} - stored: {stored_location}, provided: {location}")
             return jsonify({"message": "Location does not match!"}), 403
-
-        # Verify password
         if not bcrypt.check_password_hash(password_hash, password):
+            logger.info(f"Login failed: Invalid password - {email}")
             return jsonify({"message": "Invalid password!"}), 400
-
-        # If the user is an admin and pwdchanged is False, block login
         if actual_role == "admin" and not pwdchanged:
+            logger.info(f"Login failed: Default password not reset - {email}")
             return jsonify({"message": "You are using the default password. Please reset your password before logging in."}), 403
-
-        # If OTP is not provided yet, ask for it
         if not otp_code:
+            logger.info(f"Login failed: OTP code required - {email}")
             return jsonify({"message": "2FA Code required!"}), 400
-
-        # Verify OTP
-        totp = pyotp.TOTP(otp_secret)
-        if not totp.verify(otp_code):
+        if not pyotp.TOTP(otp_secret).verify(otp_code):
+            logger.info(f"Login failed: Invalid OTP - {email}")
             return jsonify({"message": "Invalid 2FA Code!"}), 400
 
-        # Generate JWT token
-        token = create_access_token(identity={"email": email, "role": actual_role})
+        # Generate JWT token with email as identity and role as a claim
+        token = create_access_token(identity=email, additional_claims={"role": actual_role})
+        refresh_token = create_refresh_token(identity=email, additional_claims={"role": actual_role})
+        logger.info(f"Login successful: {email}, role: {actual_role}")
         return jsonify({
             "message": "Login successful!",
             "token": token,
+            "refresh_token": refresh_token,
             "role": actual_role,
-            "pwdChanged": pwdchanged  # Return the actual value of pwdchanged
+            "pwdChanged": pwdchanged
         })
 
     except Exception as e:
+        logger.error(f"Login error for {email}: {str(e)}", exc_info=True)
         return jsonify({"message": "Internal Server Error", "error": str(e)}), 500
     finally:
         cur.close()
@@ -182,13 +214,13 @@ def verify_2fa():
     finally:
         cur.close()
         conn.close()
-    
+
 @app.route('/reset-password', methods=['POST'])
 def reset_password():
     data = request.json
     email = data.get('email')
-    old_password = data.get('oldPassword')  # Old password entered by the user
-    new_password = data.get('newPassword')  # New password for reset
+    old_password = data.get('oldPassword')
+    new_password = data.get('newPassword')
 
     if not email or not old_password or not new_password:
         return jsonify({"message": "Email, old password, and new password are required!"}), 400
@@ -197,7 +229,6 @@ def reset_password():
     cur = conn.cursor()
 
     try:
-        # Fetch user details
         cur.execute("SELECT password_hash, otp_secret, role FROM users WHERE email = %s", (email,))
         user = cur.fetchone()
         if not user:
@@ -205,17 +236,12 @@ def reset_password():
 
         password_hash, current_otp_secret, role = user
 
-        # Verify the old password
         if not bcrypt.check_password_hash(password_hash, old_password):
             return jsonify({"message": "Invalid old password!"}), 400
 
-        # Hash the new password
         hashed_password = bcrypt.generate_password_hash(new_password).decode('utf-8')
-
-        # Generate a new OTP secret
         new_otp_secret = pyotp.random_base32()
 
-        # Update the password, OTP secret, and set pwdchanged to TRUE
         cur.execute("""
             UPDATE users
             SET password_hash = %s, otp_secret = %s, pwdchanged = TRUE
@@ -223,11 +249,8 @@ def reset_password():
         """, (hashed_password, new_otp_secret, email))
         conn.commit()
 
-        # Generate a QR code for the new OTP secret
         totp = pyotp.TOTP(new_otp_secret)
         qr_data = totp.provisioning_uri(name=email, issuer_name="MyApp")
-
-        # Create a QR code image
         qr = qrcode.make(qr_data)
         img_buffer = io.BytesIO()
         qr.save(img_buffer, format="PNG")
@@ -239,10 +262,8 @@ def reset_password():
         })
 
     except Exception as e:
-        # Log the error for debugging purposes
-        print(f"Error in reset_password: {str(e)}")
+        logger.error(f"Reset password error: {str(e)}")
         return jsonify({"message": "Internal Server Error", "error": str(e)}), 500
-
     finally:
         cur.close()
         conn.close()
@@ -252,7 +273,7 @@ def forgot_password():
     data = request.json
     email = data.get('email')
     new_password = data.get('new_password')
-    otp_code = data.get('otp_code')  # 2FA code entered by the user
+    otp_code = data.get('otp_code')
 
     if not email or not new_password or not otp_code:
         return jsonify({"message": "Email, new password, and 2FA code are required!"}), 400
@@ -261,23 +282,17 @@ def forgot_password():
     cur = conn.cursor()
 
     try:
-        # Fetch user details
         cur.execute("SELECT otp_secret FROM users WHERE email = %s", (email,))
         user = cur.fetchone()
         if not user:
             return jsonify({"message": "User not found!"}), 404
 
         otp_secret = user[0]
-
-        # Verify 2FA code
         totp = pyotp.TOTP(otp_secret)
         if not totp.verify(otp_code):
             return jsonify({"message": "Invalid 2FA Code!"}), 400
 
-        # Hash the new password
         hashed_password = bcrypt.generate_password_hash(new_password).decode('utf-8')
-
-        # Update the password in the database
         cur.execute("""
             UPDATE users
             SET password_hash = %s
@@ -288,8 +303,7 @@ def forgot_password():
         return jsonify({"message": "Password updated successfully!"})
 
     except Exception as e:
-        # Log the full error for debugging
-        app.logger.error(f"Error in /forgot-password: {str(e)}")
+        logger.error(f"Forgot password error: {str(e)}")
         return jsonify({"message": "Internal Server Error", "error": str(e)}), 500
     finally:
         cur.close()
@@ -304,76 +318,63 @@ def check_admin_role():
         admin_count = cur.fetchone()[0]
         return jsonify({"adminExists": admin_count > 0})
     except Exception as e:
+        logger.error(f"Check admin role error: {str(e)}")
         return jsonify({"message": "Internal Server Error", "error": str(e)}), 500
     finally:
         cur.close()
         conn.close()
 
-@app.route('/refresh-token', methods=['POST'])
-@jwt_required(refresh=True)  # Allow refresh tokens to be used here
-def refresh_token():
-    identity = get_jwt_identity()
-    new_token = create_access_token(identity=identity)
-    return jsonify({"access_token": new_token})
-    
 @app.route('/user-management', methods=['GET'])
 @jwt_required()
 def get_pending_users():
-    identity = get_jwt_identity()
-    if identity["role"] != "admin":
+    identity = get_jwt_identity()  # Email
+    claims = get_jwt()
+    role = claims.get("role")
+    if role != "admin":
+        logger.warning(f"Access denied for {identity}: not an admin")
         return jsonify({"message": "Access denied! Admins only."}), 403
 
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT email, ip_address, location FROM users WHERE status = 'pending' and role = 'user' ")
-        pending_users = [
-            {"email": row[0], "ip_address": row[1], "location": row[2]}  # Ensure correct column order
-            for row in cur.fetchall()
-        ]
-        logging.info(f"Pending users fetched: {pending_users}")
-        cur.close()
-        conn.close()
+        cur.execute("SELECT email, ip_address, location FROM users WHERE status = 'pending' and role = 'user'")
+        pending_users = [{"email": row[0], "ip_address": row[1], "location": row[2]} for row in cur.fetchall()]
+        logger.info(f"Pending users fetched: {pending_users}")
         return jsonify({"pending_users": pending_users})
     except Exception as e:
-        logging.error(f"Error fetching pending users: {str(e)}")
+        logger.error(f"Error fetching pending users: {str(e)}")
         return jsonify({"message": "Internal Server Error", "error": str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
 
 @app.route('/approve-user', methods=['POST'])
 @jwt_required()
 def approve_user():
     identity = get_jwt_identity()
-    if identity["role"] != "admin":
+    claims = get_jwt()
+    role = claims.get("role")
+    if role != "admin":
+        logger.warning(f"Access denied for {identity}: not an admin")
         return jsonify({"message": "Access denied! Admins only."}), 403
 
     data = request.json
-    user_id = data.get("email")  # Use "email" instead of "user_id"
+    user_id = data.get("email")
 
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-
-        # Log the user_id being processed
-        app.logger.info(f"Approving user with email: {user_id}")
-
-        # Get the current timestamp
         approved_time = datetime.utcnow()
-
-        # Update the user's status to 'approved' and set the approved_at column
         cur.execute("""
             UPDATE users 
             SET status = 'approved', approved_at = %s 
             WHERE email = %s
         """, (approved_time, user_id))
         conn.commit()
-
-        # Log success
-        app.logger.info(f"User {user_id} approved successfully at {approved_time}.")
-
+        logger.info(f"User {user_id} approved by {identity} at {approved_time}")
         return jsonify({"message": "User approved successfully!"})
     except Exception as e:
-        # Log the error
-        app.logger.error(f"Error in /approve-user: {str(e)}")
+        logger.error(f"Error approving user {user_id}: {str(e)}")
         return jsonify({"message": "Internal Server Error", "error": str(e)}), 500
     finally:
         cur.close()
@@ -383,61 +384,70 @@ def approve_user():
 @jwt_required()
 def reject_user():
     identity = get_jwt_identity()
-    if identity["role"] != "admin":
+    claims = get_jwt()
+    role = claims.get("role")
+    if role != "admin":
+        logger.warning(f"Access denied for {identity}: not an admin")
         return jsonify({"message": "Access denied! Admins only."}), 403
 
     data = request.json
-    user_id = data.get("email")  # Use "email" instead of "user_id"
-    reject_reason = data.get("rejectreason")  # Get the reject reason
+    user_id = data.get("email")
+    reject_reason = data.get("rejectreason")
 
     if not reject_reason:
+        logger.warning(f"Reject reason missing for {user_id}")
         return jsonify({"message": "Reject reason is required!"}), 400
 
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-
-        # Update the user's status to 'rejected' and save the reject reason
         cur.execute("""
             UPDATE users
             SET status = 'rejected', rejectreason = %s
             WHERE email = %s
         """, (reject_reason, user_id))
         conn.commit()
-
+        logger.info(f"User {user_id} rejected by {identity} with reason: {reject_reason}")
         return jsonify({"message": "User rejected successfully!"})
     except Exception as e:
+        logger.error(f"Error rejecting user {user_id}: {str(e)}")
         return jsonify({"message": "Internal Server Error", "error": str(e)}), 500
     finally:
         cur.close()
         conn.close()
-    
+
 @app.route('/all-users', methods=['GET'])
 @jwt_required()
 def get_all_users():
     identity = get_jwt_identity()
-    if identity["role"] != "admin":
+    claims = get_jwt()
+    role = claims.get("role")
+    if role != "admin":
+        logger.warning(f"Access denied for {identity}: not an admin")
         return jsonify({"message": "Access denied! Admins only."}), 403
 
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT email, role, status, location FROM users")
-        all_users = [
-            {"email": row[0], "role": row[1], "status": row[2], "location": row[3]}
-            for row in cur.fetchall()
-        ]
-        cur.close()
-        conn.close()
+        all_users = [{"email": row[0], "role": row[1], "status": row[2], "location": row[3]} for row in cur.fetchall()]
+        logger.info(f"All users fetched by {identity}: {all_users}")
         return jsonify({"all_users": all_users})
     except Exception as e:
+        logger.error(f"Error fetching all users: {str(e)}")
         return jsonify({"message": "Internal Server Error", "error": str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
 
 @app.route('/disable-user', methods=['POST'])
 @jwt_required()
 def disable_user():
     identity = get_jwt_identity()
-    if identity["role"] != "admin":
+    claims = get_jwt()
+    role = claims.get("role")
+    if role != "admin":
+        logger.warning(f"Access denied for {identity}: not an admin")
         return jsonify({"message": "Access denied! Admins only."}), 403
 
     data = request.json
@@ -448,8 +458,24 @@ def disable_user():
         cur = conn.cursor()
         cur.execute("UPDATE users SET status = 'disabled' WHERE email = %s", (email,))
         conn.commit()
-        cur.close()
-        conn.close()
+        logger.info(f"User {email} disabled by {identity}")
         return jsonify({"message": "User disabled successfully!"})
     except Exception as e:
+        logger.error(f"Error disabling user {email}: {str(e)}")
         return jsonify({"message": "Internal Server Error", "error": str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/refresh-token', methods=['POST'])
+@jwt_required(refresh=True)
+def refresh_token():
+    identity = get_jwt_identity()  # Email
+    claims = get_jwt()
+    role = claims.get("role")
+    new_token = create_access_token(identity=identity, additional_claims={"role": role})
+    logger.info(f"Token refreshed for {identity}")
+    return jsonify({"access_token": new_token})
+
+if __name__ == '__main__':
+    app.run(host=os.getenv('LOGIN_FLASK_HOST'), port=os.getenv('LOGIN_FLASK_PORT'), debug=os.getenv('LOGIN_FLASK_DEBUG') == 'True')
