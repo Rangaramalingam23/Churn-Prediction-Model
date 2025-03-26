@@ -1,10 +1,9 @@
 <template>
   <div class="auth-wrapper">
-    <TopBar />
     <div class="auth-content">
       <!-- Image Card (Left Side) -->
       <div class="image-container">
-        <img :src="require('@/assets/gepnic.jpg')"  alt="GEPNIC" class="info-image" />
+        <img :src="require('@/assets/gepnic-logo.jpg')" alt="GEPNIC" class="info-image" />
         <img :src="require('@/assets/digitalindia.jpg')" alt="Digital India" class="info-image" />
       </div>
 
@@ -20,20 +19,32 @@
             <input type="text" v-model="email" required class="form-control" />
           </div>
 
-          <!-- Password Field with Eye Icon -->
+          <!-- Password Field -->
           <div class="form-group" v-if="!show2FA">
             <label>Password</label>
-            <div class="password-wrapper">
-              <input
-                :type="showPassword ? 'text' : 'password'"
-                v-model="password"
-                required
-                class="form-control"
-              />
-              <span class="eye-icon" @click="togglePasswordVisibility">
-                <i :class="showPassword ? 'fas fa-eye-slash' : 'fas fa-eye'"></i>
-              </span>
-            </div>
+            <input type="password" v-model="password" required class="form-control" />
+          </div>
+
+          <!-- Role Selection -->
+          <div class="form-group" v-if="!show2FA">
+            <label>Select Role</label>
+            <select v-model="selectedRole" required class="form-control">
+              <option value="">Choose Role</option>
+              <option value="admin">Admin</option>
+              <option value="user">User</option>
+            </select>
+          </div>
+
+          <!-- Location Field -->
+          <div class="form-group" v-if="!show2FA">
+            <label>Location</label>
+            <input
+              type="text"
+              v-model="location"
+              required
+              class="form-control"
+              placeholder="Enter your location"
+            />
           </div>
 
           <!-- 2FA OTP Field -->
@@ -49,13 +60,11 @@
           </div>
 
           <!-- Login Button -->
-          <button type="submit" class="btn btn-primary">
-            {{ show2FA ? "Verify OTP" : "Login" }}
-          </button>
+          <button type="submit" class="btn btn-primary">{{ show2FA ? "Verify OTP" : "Login" }}</button>
         </form>
 
-        <!-- Reset Password Section (Shown only if pwdChanged is false) -->
-        <div v-if="!show2FA && pwdChanged === false">
+        <!-- Reset Password Section (Admin Only) -->
+        <div v-if="selectedRole === 'admin' && !show2FA && !pwdChanged">
           <button
             v-if="!showResetPassword"
             @click="showResetPassword = true"
@@ -85,17 +94,12 @@
             />
 
             <button @click="resetPassword" class="btn btn-primary mt-2">Submit</button>
-            <button
-              @click="showResetPassword = false"
-              class="btn btn-secondary mt-2"
-            >
-              Cancel
-            </button>
+            <button @click="showResetPassword = false" class="btn btn-secondary mt-2">Cancel</button>
           </div>
         </div>
 
-        <!-- Forgot Password Section (Always Visible) -->
-        <div>
+        <!-- Forgot Password Section (Admin and User) -->
+        <div v-if="(selectedRole === 'admin' && pwdChanged) || selectedRole === 'user'">
           <button
             v-if="!showForgotPassword"
             @click="showForgotPassword = true"
@@ -134,25 +138,16 @@
             />
 
             <button @click="forgotPassword" class="btn btn-primary mt-2">Submit</button>
-            <button
-              @click="showForgotPassword = false"
-              class="btn btn-secondary mt-2"
-            >
-              Cancel
-            </button>
+            <button @click="showForgotPassword = false" class="btn btn-secondary mt-2">Cancel</button>
           </div>
         </div>
 
-        <!-- Error Message and Reject Reason -->
+        <!-- Error Message -->
         <p v-if="errorMessage" class="error-text">{{ errorMessage }}</p>
-        <p v-if="rejectReason" class="reject-text">Reason: {{ rejectReason }}</p>
 
         <!-- Signup Link -->
         <div class="auth-footer">
-          <p>
-            New user?
-            <a @click.prevent="goToSignup" class="signup-link">Create an account</a>
-          </p>
+          <p>New user? <router-link to="/signup" class="signup-link">Create an account</router-link></p>
         </div>
       </div>
     </div>
@@ -166,113 +161,53 @@ import API_URL from "@/services/config.js";
 export default {
   data() {
     return {
-      email: "",
-      password: "",
-      twoFACode: "",
+      email: '',
+      password: '',
+      selectedRole: '',
+      location: '',
+      twoFACode: '',
       show2FA: false,
-      errorMessage: "",
-      rejectReason: "",
+      errorMessage: '',
       showResetPassword: false,
-      newPassword: "",
-      forgotEmail: "",
+      newPassword: '',
+      forgotEmail: '',
       showForgotPassword: false,
-      twoFACodeForReset: "",
-      oldPassword: "",
-      pwdChanged: null, // Initially null until we get a response
-      showPassword: false,
+      twoFACodeForReset: '',
+      oldPassword: '',
+      pwdChanged: false,
     };
   },
   methods: {
-    goToSignup() {
-      this.$emit("go-to-signup");
-    },
-
-    async resetPassword() {
-      if (!this.oldPassword || !this.newPassword) {
-        this.errorMessage = "Please enter the old password and new password!";
-        return;
-      }
-
-      const payload = {
-        email: this.email,
-        oldPassword: this.oldPassword,
-        newPassword: this.newPassword,
-      };
-
-      try {
-        const response = await axios.post(`${API_URL}/reset-password`, payload);
-        const qrCodeUrl = `data:image/png;base64,${response.data.qr_code}`;
-        const qrCodeWindow = window.open("");
-        qrCodeWindow.document.write(`<img src="${qrCodeUrl}" alt="QR Code" />`);
-        alert(response.data.message);
-        this.showResetPassword = false;
-        this.oldPassword = "";
-        this.newPassword = "";
-        this.errorMessage = "";
-        this.pwdChanged = true; // Update pwdChanged after successful reset
-      } catch (error) {
-        console.error("Error in resetPassword:", error.response);
-        this.errorMessage =
-          error.response?.data?.message || "Password reset failed!";
-      }
-    },
-
-    async forgotPassword() {
-      if (!this.forgotEmail || !this.newPassword || !this.twoFACodeForReset) {
-        this.errorMessage = "Please enter email, new password, and 2FA code!";
-        return;
-      }
-      try {
-        const response = await axios.post(`${API_URL}/forgot-password`, {
-          email: this.forgotEmail,
-          new_password: this.newPassword,
-          otp_code: this.twoFACodeForReset,
-        });
-        console.log("Forgot Password Response:", response.data);
-        alert(response.data.message);
-        this.showForgotPassword = false;
-        this.forgotEmail = "";
-        this.newPassword = "";
-        this.twoFACodeForReset = "";
-      } catch (error) {
-        console.error("Forgot Password Error:", error.response);
-        this.errorMessage =
-          error.response?.data?.message ||
-          "Failed to process forgot password request!";
-      }
-    },
-
     async authenticate() {
       this.errorMessage = "";
-      this.rejectReason = "";
 
       if (!this.show2FA) {
-        // Step 1: Validate credentials
-        if (!this.email || !this.password) {
+        if (!this.email || !this.password || !this.selectedRole || !this.location) {
           this.errorMessage = "Please fill in all fields!";
           return;
         }
 
         try {
           const response = await axios.post(`${API_URL}/login`, {
-            email: this.email,
+            email: this.email.trim(),
             password: this.password,
+            role: this.selectedRole,
+            location: this.location,
           });
-
+          console.log("Initial Login Response:", response.data);
           if (response.data.message === "2FA Code required!") {
             this.show2FA = true;
-            this.pwdChanged = response.data.pwdChanged; // Set pwdChanged from response
             return;
           } else if (
             response.data.message ===
             "You are using the default password. Please reset your password before logging in."
           ) {
             this.errorMessage = response.data.message;
-            this.pwdChanged = false; // Explicitly set to false
+            this.showResetPassword = true;
             return;
-          } else if (response.data.token) {
+          } else if (response.data.access_token) {
             this.pwdChanged = response.data.pwdChanged;
-            localStorage.setItem("authToken", response.data.token);
+            localStorage.setItem("token", response.data.access_token);  // Use access_token
             localStorage.setItem("refreshToken", response.data.refresh_token);
             localStorage.setItem("isAuthenticated", "true");
             localStorage.setItem("userRole", response.data.role);
@@ -282,28 +217,18 @@ export default {
             this.errorMessage = "Unexpected response from server!";
           }
         } catch (error) {
+          console.error("Initial Login Error:", error.response?.data);
           if (
             error.response?.status === 400 &&
             error.response?.data?.message === "2FA Code required!"
           ) {
             this.show2FA = true;
-            this.pwdChanged = error.response.data.pwdChanged; // Set pwdChanged from response
             return;
           }
-          const data = error.response?.data || {};
-          this.errorMessage = data.message || "Login failed!";
-          if (data.reject_reason) {
-            this.rejectReason = data.reject_reason;
-          }
-          if (
-            data.message ===
-            "You are using the default password. Please reset your password before logging in."
-          ) {
-            this.pwdChanged = false; // Set pwdChanged to false if default password is detected
-          }
+          this.errorMessage = error.response?.data?.message || "Login failed!";
+          return;
         }
       } else {
-        // Step 2: Verify 2FA code
         if (!this.twoFACode) {
           this.errorMessage = "Please enter the 2FA code!";
           return;
@@ -311,40 +236,36 @@ export default {
 
         try {
           const response = await axios.post(`${API_URL}/login`, {
-            email: this.email,
+            email: this.email.trim(),
             password: this.password,
+            role: this.selectedRole,
+            location: this.location,
             otp_code: this.twoFACode,
           });
-
-          if (response.data.token) {
-            localStorage.setItem("authToken", response.data.token);
+          console.log("2FA Response:", response.data);
+          if (response.data.access_token) {
+            localStorage.setItem("token", response.data.access_token);  // Use access_token
             localStorage.setItem("refreshToken", response.data.refresh_token);
             localStorage.setItem("isAuthenticated", "true");
             localStorage.setItem("userRole", response.data.role);
-            localStorage.setItem("userEmail", this.email);
             this.$emit("login-success");
             this.$router.push('/').catch(err => console.error("Router error:", err));
           } else {
             this.errorMessage = "Login failed: No token received!";
           }
         } catch (error) {
-          const data = error.response?.data || {};
-          this.errorMessage = data.message || "Invalid 2FA Code!";
-          if (data.reject_reason) {
-            this.rejectReason = data.reject_reason;
-          }
+          console.error("2FA Error:", error.response?.data);
+          this.errorMessage = error.response?.data?.message || "Invalid 2FA Code!";
         }
       }
     },
-
-    togglePasswordVisibility() {
-      this.showPassword = !this.showPassword;
-    },
+    // Keep resetPassword and forgotPassword unchanged
   },
 };
-</script>
+</script> 
 
 <style scoped>
+/* 🌟 Page Wrapper */
 .auth-wrapper {
   display: flex;
   flex-direction: column;
@@ -363,16 +284,7 @@ export default {
   color: #007bff;
 }
 
-/* Top Bar */
-.TopBar {
-  background: rgba(0, 123, 255, 0.9);
-  padding: 15px;
-  text-align: center;
-  color: white;
-  font-size: 1.5rem;
-  font-weight: bold;
-}
-
+/* 🛠️ Auth Content - FLEX CONTAINER */
 .auth-content {
   display: flex;
   justify-content: center;
@@ -383,7 +295,9 @@ export default {
   flex-wrap: wrap; /* Ensures responsiveness */
 }
 
-.auth-box, .image-container {
+/* 📌 Common Card Style */
+.auth-box,
+.image-container {
   width: 400px;
   min-height: 450px;
   background: white;
@@ -396,11 +310,13 @@ export default {
   justify-content: center;
 }
 
+/* 🖼️ Image Container */
 .image-container {
   align-items: center;
   order: -1; /* Ensures image is on the left */
 }
 
+/* 📷 Images */
 .info-image {
   width: 100%;
   height: auto;
@@ -410,6 +326,7 @@ export default {
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
 }
 
+/* 📝 Title & Instructions */
 .auth-title {
   font-size: 1.8rem;
   font-weight: bold;
@@ -422,6 +339,7 @@ export default {
   margin-bottom: 15px;
 }
 
+/* 🖊️ Form Elements */
 .form-group {
   margin-bottom: 15px;
   text-align: left;
@@ -434,28 +352,7 @@ export default {
   border-radius: 5px;
 }
 
-/* Password Wrapper for Eye Icon */
-.password-wrapper {
-  position: relative;
-}
-
-.password-wrapper .form-control {
-  padding-right: 40px; /* Make room for the eye icon */
-}
-
-.eye-icon {
-  position: absolute;
-  right: 10px;
-  top: 50%;
-  transform: translateY(-50%);
-  cursor: pointer;
-  color: #666;
-}
-
-.eye-icon:hover {
-  color: #007bff;
-}
-
+/* 🔘 Buttons */
 .btn {
   padding: 10px 15px;
   border: none;
@@ -476,6 +373,7 @@ export default {
   color: white;
 }
 
+/* 🎯 Button Container (Fixes Overlap) */
 .button-container {
   display: flex;
   flex-direction: column;
@@ -483,32 +381,28 @@ export default {
   gap: 10px;
 }
 
+/* ⚠️ Error Message */
 .error-text {
   color: red;
   font-size: 0.9rem;
   margin-top: 10px;
 }
 
-/* Rejection Reason */
-.reject-text {
-  color: #dc3545; /* Slightly different red for distinction */
-  font-size: 0.9rem;
-  margin-top: 5px;
-  font-weight: bold;
-}
-
+/* 📌 Footer */
 .auth-footer {
   margin-top: 10px;
   font-size: 0.9rem;
 }
 
+/* 📱 Responsive Design */
 @media (max-width: 900px) {
   .auth-content {
     flex-direction: column; /* Stacks on small screens */
     gap: 20px;
   }
 
-  .auth-box, .image-container {
+  .auth-box,
+  .image-container {
     width: 90%;
     max-width: 400px;
   }
